@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "kdm.presets",
+  "name": "Presets",
+  "version": "2.0.0",
+  "author": "kdm",
+  "license": "MIT",
+  "description": "Launch a saved set of windows at once, or a whole multi-workspace profile — with quick-launch shortcuts and an optional run-at-login default",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Presets.qml"
+  },
+  "barWidget": {
+    "displayName": "Presets",
+    "description": "Presets and multi-workspace profiles, launched from the bar, a keyboard shortcut, or at login",
+    "category": "Custom",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

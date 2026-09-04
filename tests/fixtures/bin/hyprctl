@@ -1,0 +1,7 @@
+#!/bin/bash
+set -euo pipefail
+
+# The onboarding path reloads Hyprland and then asks for config errors. The
+# consent test only needs those operations to succeed without touching the
+# developer's live compositor.
+exit 0
