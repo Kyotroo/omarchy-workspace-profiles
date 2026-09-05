@@ -127,6 +127,13 @@ done | sort -f
   property var profiles: []
   property var shortcuts: []
   property var activationSteps: []
+  property bool activationRunning: false
+  property string activationError: ""
+  // One worker serializes all data writes; edits coalesce by destination.
+  property var pendingWrites: ({})
+  property string writingPath: ""
+  property string writingJson: ""
+  property string saveError: ""
   // true until the onboarding FileView proves otherwise (FileNotFound) —
   // fail toward "don't nag" rather than "always ask" if detection is ever
   // ambiguous (e.g. a permission error reading the marker).
@@ -209,6 +216,7 @@ done | sort -f
   // -------------------------------------------------------------- shortcuts
 
   function loadShortcuts(raw) {
+    if (hasPendingWrite(shortcutsPath)) return
     try {
       var parsed = JSON.parse(raw)
       root.shortcuts = Array.isArray(parsed) ? parsed : []
@@ -397,7 +405,7 @@ done | sort -f
     // Don't reset away from "activating" if a profile launch is still
     // running in the background — reopening the panel mid-launch should
     // show live progress, not silently drop back to the preset list.
-    if (!(mode === "activating" && activationSteps.length > 0 && !activationComplete)) {
+    if (!activationRunning) {
       mode = root.onboardingDone ? "list" : "onboarding"
       onboardingPhase = "ask"
     }
@@ -408,6 +416,7 @@ done | sort -f
   }
 
   function loadPresets(raw) {
+    if (hasPendingWrite(presetsPath)) return
     try {
       var parsed = JSON.parse(raw)
       root.presets = Array.isArray(parsed) ? parsed : []
@@ -417,18 +426,44 @@ done | sort -f
     if (selectedIndex >= presets.length) selectedIndex = Math.max(0, presets.length - 1)
   }
 
-  // Write to a sibling temp file, then mv into place — same directory, so
-  // the rename is atomic on a normal filesystem. A direct overwrite that
-  // got interrupted mid-write would leave truncated JSON, and the loader's
-  // parse-failure fallback (empty array) would read that back as "everything
-  // gone" rather than an error — this removes that risk entirely.
+  function hasPendingWrite(path) {
+    return writingPath === path || pendingWrites[path] !== undefined
+  }
+
   function persistJson(path, data) {
-    var json = JSON.stringify(data, null, 2) + "\n"
-    var dir = path.substring(0, path.lastIndexOf("/"))
-    var tmpPath = path + ".tmp"
-    Util.execDetached("mkdir -p " + Util.shellQuote(dir)
-      + " && printf %s " + Util.shellQuote(json) + " > " + Util.shellQuote(tmpPath)
-      + " && mv " + Util.shellQuote(tmpPath) + " " + Util.shellQuote(path))
+    var next = Object.assign({}, pendingWrites)
+    next[path] = JSON.stringify(data, null, 2) + "\n"
+    pendingWrites = next
+    startNextWrite()
+  }
+
+  function startNextWrite() {
+    if (writingPath !== "") return
+    var paths = Object.keys(pendingWrites)
+    if (paths.length === 0) return
+    writingPath = paths[0]
+    writingJson = pendingWrites[writingPath]
+    var next = Object.assign({}, pendingWrites)
+    delete next[writingPath]
+    pendingWrites = next
+    saveProcess.command = ["bash", helperPath("write-json.sh"), writingPath, writingJson]
+    saveProcess.running = true
+  }
+
+  function finishWrite(exitCode) {
+    if (exitCode !== 0) {
+      var next = Object.assign({}, pendingWrites)
+      // Retain unsaved data, but never replace a newer pending edit.
+      if (next[writingPath] === undefined) next[writingPath] = writingJson
+      pendingWrites = next
+      saveError = "Could not save changes. Retry when storage is available."
+    }
+    writingPath = ""
+    writingJson = ""
+    if (exitCode === 0) {
+      saveError = ""
+      startNextWrite()
+    }
   }
 
   function persistPresets() {
@@ -438,6 +473,7 @@ done | sort -f
   // -------------------------------------------------------------- profiles
 
   function loadProfiles(raw) {
+    if (hasPendingWrite(profilesPath)) return
     try {
       var parsed = JSON.parse(raw)
       root.profiles = Array.isArray(parsed) ? parsed : []
@@ -570,143 +606,68 @@ done | sort -f
 
   // ---------------------------------------------------------- activation
 
-  // One shell one-liner per window entry, same shape commandForWindow()
-  // already produces for a single preset — reused unchanged here.
-  function buildProfileScript(profile) {
-    var steps = (profile && profile.workspaces) || []
-    var closeMode = String((profile && profile.closeMode) || "trackedOnly")
-    var initialSteps = []
-    for (var s = 0; s < steps.length; s++)
-      initialSteps.push({ workspace: steps[s].workspace, preset: steps[s].preset, status: "pending" })
-
-    var lines = []
-    lines.push('progress_file=' + Util.shellQuote(root.progressPath))
-    lines.push('active_file=' + Util.shellQuote(root.activeProfilePath))
-    lines.push('profile_name=' + Util.shellQuote(String(profile.name)))
-    lines.push('new_windows_file=$(mktemp)')
-    lines.push('mkdir -p "$(dirname "$progress_file")" "$(dirname "$active_file")"')
-    lines.push('printf %s ' + Util.shellQuote(JSON.stringify(initialSteps)) + ' > "$progress_file.tmp" && mv "$progress_file.tmp" "$progress_file"')
-    lines.push('old_active=$(cat "$active_file" 2>/dev/null || echo "{}")')
-    lines.push('wait_launch() {')
-    lines.push('  before=$(hyprctl clients -j | jq -r ".[].address" | sort)')
-    lines.push('  eval "$1" &')
-    lines.push('  disown')
-    lines.push('  i=0; LAST_NEW_ADDR=""')
-    lines.push('  while [ "$i" -lt 50 ]; do')
-    lines.push('    after=$(hyprctl clients -j | jq -r ".[].address" | sort)')
-    lines.push('    new=$(comm -13 <(printf "%s\\n" "$before") <(printf "%s\\n" "$after"))')
-    lines.push('    if [ -n "$new" ]; then LAST_NEW_ADDR=$(printf "%s\\n" "$new" | head -n1); break; fi')
-    lines.push('    sleep 0.1; i=$((i+1))')
-    lines.push('  done')
-    lines.push('}')
-    lines.push('mark_done() {')
-    lines.push('  tmp=$(mktemp)')
-    lines.push('  jq --argjson ws "$1" --arg preset "$2" \'map(if .workspace==$ws and .preset==$preset then .status="done" else . end)\' "$progress_file" > "$tmp" && mv "$tmp" "$progress_file"')
-    lines.push('}')
-    // Polling instead of a fixed sleep: a fixed delay after the workspace
-    // switch was flaky under scripted (non-interactive) timing — confirmed
-    // live this session, a launch fired right after the switch sometimes
-    // still landed on the old workspace because the switch hadn't actually
-    // committed yet. Same "wait for the real state, not a guessed delay"
-    // principle wait_launch above already uses for window creation.
-    lines.push('wait_workspace() {')
-    lines.push('  i=0')
-    lines.push('  while [ "$i" -lt 30 ]; do')
-    lines.push('    cur=$(hyprctl activeworkspace -j | jq -r .id)')
-    lines.push('    if [ "$cur" = "$1" ]; then return; fi')
-    lines.push('    sleep 0.1; i=$((i+1))')
-    lines.push('  done')
-    lines.push('}')
-    // hl.dsp.window.close() sends a polite xdg-toplevel close request —
-    // confirmed live this session that it's unreliable for the "held open"
-    // terminals every terminal-type entry launches (`bash -c '<cmd>; read
-    // -r _'`), sometimes not closing at all after 3+ seconds of polling.
-    // Killing the process by PID (already exposed on every hyprctl clients
-    // entry) is the standard, reliable mechanism and was confirmed to work
-    // immediately in the same live test where close() had just timed out.
-    lines.push('close_window() {')
-    lines.push('  pid=$(hyprctl clients -j | jq -r --arg addr "$1" \'.[] | select(.address==$addr) | .pid\')')
-    lines.push('  [ -n "$pid" ] && [ "$pid" != "null" ] && kill "$pid" 2>/dev/null')
-    lines.push('  i=0')
-    lines.push('  while [ "$i" -lt 30 ]; do')
-    lines.push('    hyprctl clients -j | jq -e --arg addr "$1" \'any(.[]; .address == $addr)\' >/dev/null 2>&1 || return')
-    lines.push('    sleep 0.1; i=$((i+1))')
-    lines.push('  done')
-    lines.push('}')
-
-    for (var i = 0; i < steps.length; i++) {
-      var step = steps[i]
-      var ws = parseInt(step.workspace, 10)
+  // Resolve and validate the whole profile before making any desktop changes.
+  function profileValidationError(profile) {
+    if (!profile || !String(profile.name || "").trim()) return "A profile name is required."
+    if (!Array.isArray(profile.workspaces) || profile.workspaces.length === 0) return "Add at least one workspace."
+    if (closeModes.indexOf(profile.closeMode || "trackedOnly") < 0) return "Invalid close mode."
+    var seen = {}
+    for (var i = 0; i < profile.workspaces.length; i++) {
+      var step = profile.workspaces[i]
+      if (!step || typeof step.workspace !== "number" || !isFinite(step.workspace)
+          || step.workspace < 1 || Math.floor(step.workspace) !== step.workspace)
+        return "Invalid workspace number."
+      if (seen[step.workspace]) return "Workspace " + step.workspace + " appears more than once."
+      seen[step.workspace] = true
       var preset = root.presetByName(step.preset)
-      var presetQ = Util.shellQuote(String(step.preset))
-
-      // This system runs a Lua-scripted Hyprland config (Omarchy "quattro"),
-      // under which classic `hyprctl dispatch workspace N` silently fails —
-      // hyprctl re-parses the dispatch string as Lua (`hl.dispatch(workspace
-      // N)`), which isn't valid Lua syntax for anything but the object-call
-      // form. Confirmed by direct testing this session (classic form errored
-      // with "dispatch in lua is a shorthand for hl.dispatch(...), your
-      // syntax might need to be updated"); `hl.dsp.focus({ workspace = "N" })`
-      // is the working form, confirmed live, matching the style this shell's
-      // own Workspaces.qml already uses. (Window closing, below in
-      // close_window(), turned out to need PID-based kill instead of the
-      // equivalent `hl.dsp.window.close()` — see that function's comment.)
-      lines.push('hyprctl dispatch ' + Util.shellQuote('hl.dsp.focus({ workspace = "' + ws + '" })') + ' >/dev/null 2>&1')
-      lines.push('wait_workspace ' + ws)
-      lines.push('hyprctl keyword workspace "' + ws + ', layout:scrolling" >/dev/null 2>&1')
-
-      if (closeMode === 'trackedOnly') {
-        // Heads-up (not a blocking prompt, per plan) when this workspace has
-        // windows the user opened by hand that we're about to leave sitting
-        // next to freshly-launched ones — trackedOnly only closes what we
-        // ourselves tracked, so anything else here is "not clean" as far as
-        // this profile activation is concerned.
-        lines.push('tracked_here=$(printf "%s" "$old_active" | jq -r --argjson ws ' + ws
-          + ' \'(.windows // []) | .[] | select(.workspace==$ws) | .address\')')
-        lines.push('untracked_here=$(hyprctl clients -j | jq -r --argjson ws ' + ws
-          + ' \'.[] | select(.workspace.id==$ws) | .address\' | grep -vxF "$tracked_here" || true)')
-        lines.push('if [ -n "$untracked_here" ]; then omarchy-notification-send'
-          + ' "Workspace ' + ws + ' still has other windows"'
-          + ' "$profile_name only closes what it opened last time — the rest stayed" 2>/dev/null; fi')
-        lines.push('printf "%s\\n" "$tracked_here" | while read -r addr; do'
-          + ' [ -n "$addr" ] && close_window "$addr"; done')
-      } else if (closeMode === 'workspaceAll') {
-        lines.push('hyprctl clients -j | jq -r --argjson ws ' + ws
-          + ' \'.[] | select(.workspace.id==$ws) | .address\' | while read -r addr; do'
-          + ' [ -n "$addr" ] && close_window "$addr"; done')
+      if (!preset) return "Missing preset: " + step.preset + ". Update the profile before launching."
+      if (!Array.isArray(preset.windows)) return "Invalid window list in " + preset.name + "."
+      for (var j = 0; j < preset.windows.length; j++) {
+        var w = preset.windows[j]
+        if (!w || windowTypes.indexOf(w.type) < 0 || typeof w.value !== "string" || !w.value.trim())
+          return "Invalid window in " + preset.name + "."
       }
-
-      var windows = (preset && preset.windows) || []
-      for (var j = 0; j < windows.length; j++) {
-        var cmd = root.commandForWindow(windows[j])
-        if (cmd === "") continue
-        lines.push('wait_launch ' + Util.shellQuote(cmd))
-        lines.push('[ -n "$LAST_NEW_ADDR" ] && jq -n --argjson ws ' + ws
-          + ' --arg addr "$LAST_NEW_ADDR" --arg preset ' + presetQ
-          + ' \'{workspace:$ws, address:$addr, preset:$preset}\' >> "$new_windows_file"')
-      }
-      lines.push('mark_done ' + ws + ' ' + presetQ)
     }
+    return ""
+  }
 
-    lines.push('windows_json=$(jq -s . "$new_windows_file" 2>/dev/null)')
-    lines.push('[ -n "$windows_json" ] || windows_json="[]"')
-    lines.push('jq -n --arg profile ' + Util.shellQuote(String(profile.name))
-      + ' --argjson windows "$windows_json" \'{profile:$profile, windows:$windows}\' > "$active_file.tmp" && mv "$active_file.tmp" "$active_file"')
-    lines.push('rm -f "$new_windows_file"')
+  function helperPath(name) {
+    return decodeURIComponent(String(Qt.resolvedUrl("scripts/" + name)).replace(/^file:\/\//, ""))
+  }
 
-    return lines.join('\n')
+  function buildProfileScript(profile) {
+    var error = profileValidationError(profile)
+    if (error) return ""
+    var plan = {name: profile.name, closeMode: profile.closeMode || "trackedOnly", workspaces: []}
+    for (var i = 0; i < profile.workspaces.length; i++) {
+      var step = profile.workspaces[i]
+      var preset = presetByName(step.preset)
+      plan.workspaces.push({workspace: step.workspace, preset: step.preset,
+        commands: preset.windows.map(function(w) { return root.commandForWindow(w) })})
+    }
+    var dir = root.progressPath.substring(0, root.progressPath.lastIndexOf("/"))
+    return "exec bash " + Util.shellQuote(helperPath("activate-profile.sh"))
+      + " " + Util.shellQuote(dir) + " " + Util.shellQuote(JSON.stringify(plan))
   }
 
   function activateProfile(profile) {
-    if (!profile) return
-    var steps = (profile.workspaces || [])
-    if (steps.length === 0) return
-
-    activationSteps = steps.map(function(s) { return { workspace: s.workspace, preset: s.preset, status: "pending" } })
+    if (activationRunning) return "busy"
+    activationError = profileValidationError(profile)
+    if (activationError) {
+      mode = "activating"
+      activationSteps = []
+      Util.execDetached("omarchy-notification-send 'Cannot activate profile' " + Util.shellQuote(activationError))
+      return activationError
+    }
+    activationSteps = profile.workspaces.map(function(s) {
+      return {workspace: s.workspace, preset: s.preset, status: "pending"}
+    })
+    activationError = ""
+    activationRunning = true
     mode = "activating"
-
-    var script = buildProfileScript(profile)
-    if (script !== "" && root.bar) root.bar.run(script)
+    activationProcess.command = ["bash", "-lc", buildProfileScript(profile)]
+    activationProcess.running = true
+    return "ok"
   }
 
   function activateProfileByName(name) {
@@ -757,6 +718,17 @@ done | sort -f
 
   function deletePresetAt(index) {
     if (index < 0 || index >= root.presets.length) return
+    var name = root.presets[index].name
+    for (var p = 0; p < profiles.length; p++) {
+      var workspaces = profiles[p].workspaces || []
+      for (var w = 0; w < workspaces.length; w++) {
+        if (workspaces[w].preset === name) {
+          Util.execDetached("omarchy-notification-send 'Preset is in use' "
+            + Util.shellQuote("Remove " + name + " from profile " + profiles[p].name + " before deleting it."))
+          return
+        }
+      }
+    }
     var next = Util.cloneJson(root.presets)
     next.splice(index, 1)
     root.presets = next
@@ -981,8 +953,7 @@ done | sort -f
       var p = null
       for (var i = 0; i < root.profiles.length; i++) if (root.profiles[i].name === name) { p = root.profiles[i]; break }
       if (!p) return "not found"
-      root.activateProfile(p)
-      return "ok"
+      return root.activateProfile(p)
     }
     // Bound to SUPER+CTRL+SHIFT+1-9 in bindings.lua. Fires silently — no
     // panel, matches how fast/harmless a preset launch already is from the
@@ -1006,9 +977,27 @@ done | sort -f
       if (!s) return "not found"
       var profile = root.profileByName(s.name)
       if (!profile) return "not found"
+      if (root.activationRunning) return "busy"
       root.open()
-      root.activateProfile(profile)
-      return "ok"
+      return root.activateProfile(profile)
+    }
+  }
+
+  Process {
+    id: saveProcess
+    onExited: function(exitCode, exitStatus) { root.finishWrite(exitCode === 0 && exitStatus === 0 ? 0 : 1) }
+  }
+
+  Process {
+    id: activationProcess
+    stderr: StdioCollector { id: activationStderr; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      root.activationRunning = false
+      if (exitCode !== 0 || exitStatus !== 0) {
+        root.activationError = activationStderr.text.trim() || "Profile activation failed."
+        Util.execDetached("omarchy-notification-send 'Profile activation stopped' " + Util.shellQuote(root.activationError))
+      }
+      progressFile.reload()
     }
   }
 
@@ -1247,6 +1236,28 @@ done | sort -f
         id: column
         width: panelFlick.width
         spacing: Style.space(10)
+
+        Text {
+          visible: root.saveError !== ""
+          width: parent.width
+          text: root.saveError
+          textFormat: Text.PlainText
+          wrapMode: Text.WordWrap
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Button {
+          visible: root.saveError !== ""
+          enabled: root.writingPath === ""
+          width: parent.width
+          text: "Retry saving"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          bordered: true
+          onClicked: root.startNextWrite()
+        }
 
         // Presets and Profiles are peers, not nested — this strip is the
         // whole reason "Profiles →" (a row buried inside the preset list)
@@ -2451,7 +2462,8 @@ done | sort -f
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: root.activationComplete ? "All set." : "Setting things up — hang on…"
+            text: root.activationError || (root.activationRunning ? "Setting things up — hang on…"
+              : root.activationComplete ? "All set." : "Activation stopped.")
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -2469,7 +2481,7 @@ done | sort -f
 
               Text {
                 textFormat: Text.PlainText
-                text: modelData.status === "done" ? "✓" : "⏳"
+                text: modelData.status === "done" ? "✓" : modelData.status === "failed" ? "!" : "⏳"
                 color: modelData.status === "done" ? root.foreground : Qt.darker(root.foreground, 1.55)
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -2488,7 +2500,7 @@ done | sort -f
           }
 
           Button {
-            visible: root.activationComplete
+            visible: !root.activationRunning
             width: parent.width
             text: "Close"
             bordered: true
@@ -2517,7 +2529,7 @@ done | sort -f
             if (root.mode === "profileAddWorkspace") return "Enter a workspace number, then click the preset it should open."
             if (root.mode === "nameProfile") return "Name your new profile, then click Save."
             if (root.mode === "assignSlot") return "Pick a free slot, or click one you already used to move the shortcut here."
-            if (root.mode === "activating") return root.activationComplete ? "Done — you can close this now." : "Please wait, setting up your workspaces…"
+            if (root.mode === "activating") return root.activationRunning ? "Please wait, setting up your workspaces…" : "You can close this now."
             return ""
           }
           color: Qt.darker(root.foreground, 1.55)
