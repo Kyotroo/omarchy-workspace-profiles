@@ -34,7 +34,7 @@ and `omarchy hook` commands. It has been tested with:
 - Hyprland 0.56.2
 
 There are no extra package dependencies beyond a current Omarchy install. The
-plugin uses tools Omarchy already provides or depends on: Bash, `jq`, `luac`,
+plugin uses tools Omarchy already provides or depends on: Bash, `jq`, `flock`, `luac`,
 `hyprctl`, `omarchy-launch-terminal`, `omarchy-launch-webapp`, and
 `omarchy-notification-send`. Applications and commands saved in your presets
 are, naturally, your responsibility.
@@ -109,11 +109,30 @@ happens to windows already on those workspaces.
 
 | Close mode | Behavior |
 | --- | --- |
-| **Close ours only** | Closes only windows tracked from the profile's previous run; manually opened windows stay. This is the default. |
+| **Close ours only** | Closes this profile's tracked windows only if their process/session identity and current workspace still match. This is the default. |
 | **Close all on workspace** | Closes every window on each target workspace. |
 | **Keep existing** | Leaves all existing windows and adds the new ones. |
 
-Activating a profile shows a live pending/done list. Press `d` in a profile's
+Only one profile can activate at a time, including shortcut and IPC requests.
+A second request returns `busy`. The entire profile is checked before any
+workspace changes: missing presets, invalid entries, and repeated workspace
+numbers stop activation. A preset referenced by a profile cannot be deleted
+until that reference is removed.
+
+Closing uses a window-specific request, never process termination. If an
+application keeps a window open (for example, for a save dialog), activation
+stops with an error. Resolve the dialog before retrying. Workspace-switch and
+window-launch timeouts also stop activation and preserve tracking for windows
+already opened.
+
+Ownership is retained across profile switches and scoped to the current
+Hyprland session. On upgrade, legacy tracking records lack enough identity
+information to close safely, so existing windows are left alone. New launches
+write the stronger records. Launch detection still observes newly appearing
+windows: avoid manually opening other windows during activation, since a
+single unrelated arrival can be mistaken for the requested application.
+
+Activating a profile shows pending/running/done/failed progress. Press `d` in a profile's
 edit view to make it the login default. Only one profile can be default at a
 time; that explicit action also installs the plugin-specific post-boot hook.
 If you ever need to reinstall the hook manually, run:
@@ -166,13 +185,18 @@ Its own state lives under `~/.local/state/omarchy/kdm-presets/`:
 | `presets.json` | Preset names and ordered window definitions |
 | `profiles.json` | Profile workspace mappings, close modes, and default flag |
 | `shortcuts.json` | Numbered shortcut assignments |
-| `active-profile.json` | Windows opened by the latest profile run |
+| `active-profile.json` | Versioned window ownership records across profiles, including process/session identity |
 | `activation-progress.json` | Current profile-launch progress |
+| `activation.lock` | Advisory lock held only while a profile activation runs |
 | `onboarding.json` / `onboarding-result.json` | First-run status |
 
-Writes are atomic: each JSON update is written to a sibling temporary file and
-renamed into place. The plugin may also make these user-approved configuration
-changes:
+Preset, profile, and shortcut saves run through a single queue. Rapid edits
+coalesce to the latest snapshot, and older disk notifications cannot overwrite
+unsaved edits. Each write uses a unique sibling temporary file and an atomic
+rename. Failed saves remain in memory with a **Retry saving** action; keep the
+shell running until retry succeeds to preserve those unsaved changes.
+
+The plugin may also make these user-approved configuration changes:
 
 - append the marked shortcut block to `~/.config/hypr/bindings.lua` after the
   onboarding prompt is accepted;
@@ -233,6 +257,25 @@ only if you do not want to reinstall or keep your presets:
 
 ```bash
 rm -rf -- ~/.local/state/omarchy/kdm-presets
+```
+
+## Development checks
+
+Run the regression suite with Node.js 22+ and the normal Bash/`jq`/`flock`
+tools:
+
+```bash
+node --test tests/safety.test.cjs
+bash -n scripts/activate-profile.sh scripts/write-json.sh
+```
+
+Tests execute the QML functions and real shell helpers with a fake compositor
+and temporary state. They do not launch or close real application windows.
+On an Omarchy machine, an additional runtime check uses actual Quickshell
+FileViews and Processes, with only the display surface stubbed:
+
+```bash
+node tests/qml-smoke.cjs
 ```
 
 ## License
