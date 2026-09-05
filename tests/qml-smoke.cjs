@@ -32,6 +32,7 @@ Item {
 }
 `);
   fs.symlinkSync(path.join(repo, 'scripts'), path.join(dir, 'scripts'));
+  fs.symlinkSync(path.join(repo, 'NameEditor.qml'), path.join(dir, 'NameEditor.qml'));
   const source = fs.readFileSync(path.join(repo, 'Presets.qml'), 'utf8').replaceAll(
     'Quickshell.env("HOME") + "/.local/state/omarchy/kdm-presets/', JSON.stringify(dir).slice(0, -1) + '/');
   fs.writeFileSync(path.join(dir, 'Presets.qml'), source);

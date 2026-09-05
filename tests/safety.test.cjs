@@ -15,7 +15,7 @@ function model(dir) {
   const ctx = {
     presets: [{name: 'Work', windows: []}], profiles: [], shortcuts: [], selectedIndex: 0, profileIndex: 0, activationSteps: [],
     closeModes: ['trackedOnly', 'workspaceAll', 'keepExisting'], windowTypes: ['terminal', 'webapp', 'custom'],
-    activationRunning: false, activationError: '', mode: 'list',
+    activationRunning: false, activationError: '', mode: 'list', presetNameError: '', profileNameError: '',
     pendingWrites: {}, writingPath: '', writingJson: '', saveError: '',
     presetsPath: path.join(dir, 'presets.json'), profilesPath: path.join(dir, 'profiles.json'),
     shortcutsPath: path.join(dir, 'shortcuts.json'),
@@ -23,8 +23,9 @@ function model(dir) {
     bar: {run: script => calls.push(script)},
     activationProcess: {running: false, command: []},
     saveProcess: {running: false, command: []},
+    keyCatcher: {forceActiveFocus() {}},
     Util: {shellQuote: quote, cloneJson: x => JSON.parse(JSON.stringify(x)), execDetached: s => calls.push(s)},
-    Qt: {resolvedUrl: p => pathToFileURL(path.join(repo, p))},
+    Qt: {resolvedUrl: p => pathToFileURL(path.join(repo, p)), callLater: fn => fn()},
     calls
   };
   ctx.root = ctx;
@@ -258,4 +259,66 @@ test('failed activation releases the process lock for a retry (#6)', t => {
   delete f.env.TEST_REFUSE_CLOSE;
   assert.equal(run(f, profile('A', 'workspaceAll')).status, 0);
   assert.equal(f.clients().length, 0);
+});
+
+test('preset names are unique after trimming and case folding (#7)', t => {
+  const f = fixture(t);
+  f.ctx.mode = 'namePreset';
+  const result = f.ctx.submitNewPresetName('  work  ');
+  assert.equal(result, false);
+  assert.equal(f.ctx.presets.length, 1);
+  assert.equal(f.ctx.mode, 'namePreset');
+  assert.match(f.ctx.presetNameError, /already exists/);
+  assert.equal(f.ctx.saveProcess.running, false);
+});
+
+test('profile names are unique after trimming and case folding (#7)', t => {
+  const f = fixture(t);
+  f.ctx.profiles = [{name: 'Daily', default: false, closeMode: 'trackedOnly', workspaces: []}];
+  f.ctx.mode = 'nameProfile';
+  const result = f.ctx.submitNewProfileName(' daily ');
+  assert.equal(result, false);
+  assert.equal(f.ctx.profiles.length, 1);
+  assert.equal(f.ctx.mode, 'nameProfile');
+  assert.match(f.ctx.profileNameError, /already exists/);
+  assert.equal(f.ctx.saveProcess.running, false);
+});
+
+test('a new preset opens directly in its editor (#1)', t => {
+  const f = fixture(t);
+  f.ctx.mode = 'namePreset';
+  const result = f.ctx.submitNewPresetName('Reading');
+  assert.equal(result, true);
+  assert.equal(f.ctx.mode, 'edit');
+  assert.equal(f.ctx.editingPresetIndex, 1);
+  assert.equal(f.ctx.presets[1].name, 'Reading');
+});
+
+test('a new profile opens directly in its editor', t => {
+  const f = fixture(t);
+  f.ctx.mode = 'nameProfile';
+  const result = f.ctx.submitNewProfileName('Daily');
+  assert.equal(result, true);
+  assert.equal(f.ctx.mode, 'profileEdit');
+  assert.equal(f.ctx.editingProfileIndex, 0);
+  assert.equal(f.ctx.profiles[0].name, 'Daily');
+});
+
+test('deleting and recreating a preset does not reconnect its old shortcut (#7)', t => {
+  const f = fixture(t);
+  f.ctx.shortcuts = [{family: 'preset', slot: 1, name: 'Work'}];
+  f.ctx.deletePresetAt(0);
+  assert.deepEqual(f.ctx.shortcuts, []);
+  assert.equal(f.ctx.submitNewPresetName('Work'), true);
+  assert.equal(f.ctx.shortcutSlotForItem('preset', 'Work'), 0);
+});
+
+test('deleting and recreating a profile does not reconnect its old shortcut (#7)', t => {
+  const f = fixture(t);
+  f.ctx.profiles = [{name: 'Daily', default: false, closeMode: 'trackedOnly', workspaces: []}];
+  f.ctx.shortcuts = [{family: 'profile', slot: 2, name: 'Daily'}];
+  f.ctx.deleteProfileAt(0);
+  assert.deepEqual(f.ctx.shortcuts, []);
+  assert.equal(f.ctx.submitNewProfileName('Daily'), true);
+  assert.equal(f.ctx.shortcutSlotForItem('profile', 'Daily'), 0);
 });

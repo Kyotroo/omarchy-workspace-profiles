@@ -163,6 +163,8 @@ done | sort -f
   property int profileWorkspaceIndex: 0
   property int pickPresetIndex: 0
   property bool cursorActive: false
+  property string presetNameError: ""
+  property string profileNameError: ""
 
   // assignSlot state: which family/item we're assigning a slot to, which
   // mode to return to, and the 1-9 cursor while picking.
@@ -213,6 +215,14 @@ done | sort -f
     return null
   }
 
+  function duplicateName(items, name) {
+    var key = String(name || "").trim().toLowerCase()
+    if (key === "") return false
+    for (var i = 0; i < items.length; i++)
+      if (String(items[i].name || "").trim().toLowerCase() === key) return true
+    return false
+  }
+
   // -------------------------------------------------------------- shortcuts
 
   function loadShortcuts(raw) {
@@ -260,6 +270,13 @@ done | sort -f
 
   function clearShortcut(family, slot) {
     var next = root.shortcuts.filter(function(s) { return !(s.family === family && s.slot === slot) })
+    root.shortcuts = next
+    persistShortcuts()
+  }
+
+  function clearShortcutsForItem(family, name) {
+    var next = root.shortcuts.filter(function(s) { return !(s.family === family && s.name === name) })
+    if (next.length === root.shortcuts.length) return
     root.shortcuts = next
     persistShortcuts()
   }
@@ -501,30 +518,38 @@ done | sort -f
 
   function addProfile(name) {
     var trimmed = String(name || "").trim()
-    if (trimmed === "") return
+    if (trimmed === "") {
+      profileNameError = "Enter a profile name."
+      return -1
+    }
+    if (duplicateName(profiles, trimmed)) {
+      profileNameError = "A profile with that name already exists."
+      return -1
+    }
     var next = Util.cloneJson(root.profiles)
     next.push({ name: trimmed, default: false, closeMode: "trackedOnly", workspaces: [] })
     root.profiles = next
     profileIndex = next.length - 1
+    profileNameError = ""
     persistProfiles()
+    return profileIndex
   }
 
   function submitNewProfileName(name) {
-    addProfile(name)
-    mode = "profiles"
-    // profileNameField doesn't lose Qt keyboard focus just because its
-    // Column went invisible — without this, the next keystrokes partially
-    // leak into the hidden field instead of driving navigation (observed
-    // directly: typing after this created a second, garbage-named profile).
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    var index = addProfile(name)
+    if (index < 0) return false
+    enterProfileEdit(index)
+    return true
   }
 
   function deleteProfileAt(index) {
     if (index < 0 || index >= root.profiles.length) return
     var next = Util.cloneJson(root.profiles)
+    var name = next[index].name
     next.splice(index, 1)
     root.profiles = next
     if (profileIndex >= next.length) profileIndex = Math.max(0, next.length - 1)
+    clearShortcutsForItem("profile", name)
     persistProfiles()
   }
 
@@ -700,20 +725,28 @@ done | sort -f
 
   function addPreset(name) {
     var trimmed = String(name || "").trim()
-    if (trimmed === "") return
+    if (trimmed === "") {
+      presetNameError = "Enter a preset name."
+      return -1
+    }
+    if (duplicateName(presets, trimmed)) {
+      presetNameError = "A preset with that name already exists."
+      return -1
+    }
     var next = Util.cloneJson(root.presets)
     next.push({ name: trimmed, windows: [] })
     root.presets = next
     selectedIndex = next.length - 1
+    presetNameError = ""
     persistPresets()
+    return selectedIndex
   }
 
   function submitNewPresetName(name) {
-    addPreset(name)
-    mode = "list"
-    // See the matching comment in submitNewProfileName — same stale-focus
-    // issue applies here.
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    var index = addPreset(name)
+    if (index < 0) return false
+    enterEdit(index)
+    return true
   }
 
   function deletePresetAt(index) {
@@ -733,6 +766,7 @@ done | sort -f
     next.splice(index, 1)
     root.presets = next
     if (selectedIndex >= next.length) selectedIndex = Math.max(0, next.length - 1)
+    clearShortcutsForItem("preset", name)
     persistPresets()
   }
 
@@ -1183,6 +1217,7 @@ done | sort -f
         }
         if (root.mode === "list" && (t === "n" || t === "N")) {
           nameField.text = ""
+          root.presetNameError = ""
           root.mode = "namePreset"
           Qt.callLater(function() { nameField.forceActiveFocus() })
         } else if (root.mode === "list" && (t === "s" || t === "S")) {
@@ -1197,6 +1232,7 @@ done | sort -f
           }
         } else if (root.mode === "profiles" && (t === "n" || t === "N")) {
           profileNameField.text = ""
+          root.profileNameError = ""
           root.mode = "nameProfile"
           Qt.callLater(function() { profileNameField.forceActiveFocus() })
         } else if (root.mode === "profiles" && (t === "s" || t === "S")) {
@@ -1545,6 +1581,7 @@ done | sort -f
             onClicked: {
               root.cursorActive = false
               nameField.text = ""
+              root.presetNameError = ""
               root.mode = "namePreset"
               Qt.callLater(function() { nameField.forceActiveFocus() })
             }
@@ -1900,16 +1937,28 @@ done | sort -f
           width: parent.width
           spacing: Style.space(6)
 
-          TextField {
+          NameEditor {
             id: nameField
             width: parent.width
             foreground: root.foreground
             placeholderText: "Preset name"
 
-            onAccepted: { root.submitNewPresetName(text); text = "" }
+            onSubmitted: function(value) { if (root.submitNewPresetName(value)) text = "" }
+            onTextEdited: root.presetNameError = ""
             Keys.onEscapePressed: { text = ""; root.mode = "list" }
 
             onVisibleChanged: if (visible) Qt.callLater(forceActiveFocus)
+          }
+
+          Text {
+            visible: root.presetNameError !== ""
+            width: parent.width
+            text: root.presetNameError
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           Row {
@@ -1924,7 +1973,7 @@ done | sort -f
               fontFamily: root.fontFamily
               fontSize: Style.font.bodySmall
               verticalPadding: Style.spacing.controlPaddingY
-              onClicked: { root.submitNewPresetName(nameField.text); nameField.text = "" }
+              onClicked: if (root.submitNewPresetName(nameField.text)) nameField.text = ""
             }
 
             Button {
@@ -2059,6 +2108,7 @@ done | sort -f
             onClicked: {
               root.cursorActive = false
               profileNameField.text = ""
+              root.profileNameError = ""
               root.mode = "nameProfile"
               Qt.callLater(function() { profileNameField.forceActiveFocus() })
             }
@@ -2343,16 +2393,28 @@ done | sort -f
           width: parent.width
           spacing: Style.space(6)
 
-          TextField {
+          NameEditor {
             id: profileNameField
             width: parent.width
             foreground: root.foreground
             placeholderText: "Profile name"
 
-            onAccepted: { root.submitNewProfileName(text); text = "" }
+            onSubmitted: function(value) { if (root.submitNewProfileName(value)) text = "" }
+            onTextEdited: root.profileNameError = ""
             Keys.onEscapePressed: { text = ""; root.mode = "profiles" }
 
             onVisibleChanged: if (visible) Qt.callLater(forceActiveFocus)
+          }
+
+          Text {
+            visible: root.profileNameError !== ""
+            width: parent.width
+            text: root.profileNameError
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           Row {
@@ -2367,7 +2429,7 @@ done | sort -f
               fontFamily: root.fontFamily
               fontSize: Style.font.bodySmall
               verticalPadding: Style.spacing.controlPaddingY
-              onClicked: { root.submitNewProfileName(profileNameField.text); profileNameField.text = "" }
+              onClicked: if (root.submitNewProfileName(profileNameField.text)) profileNameField.text = ""
             }
 
             Button {

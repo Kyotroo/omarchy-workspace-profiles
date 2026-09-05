@@ -69,7 +69,8 @@ a profile as the default. Its path is:
 ## Quick start
 
 1. Open Presets and choose **New preset** (`n`).
-2. Open the preset, choose **Add window** (`a`), and add any combination of:
+2. After saving the name, the new preset opens directly in its editor. Choose
+   **Add window** (`a`) and add any combination of:
    - **Terminal** — a command opened in a terminal, such as `btop`.
    - **Web app** — an installed Omarchy web app or a custom URL such as
      `https://omarchy.org`.
@@ -97,6 +98,11 @@ a profile as the default. Its path is:
 
 Terminal and Custom entries can have an optional display title. Installed web
 apps use the title from their desktop entry automatically.
+
+Preset names must be unique, ignoring surrounding spaces and letter case. The
+same rule applies separately to profile names. A duplicate stays in the naming
+form with an inline message, so shortcuts and profile references always resolve
+to one item.
 
 ## Profiles
 
