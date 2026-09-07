@@ -631,10 +631,21 @@ done | sort -f
 
   // ---------------------------------------------------------- activation
 
+  // A Repeater hands its delegate a `modelData` whose nested arrays are
+  // QVariantList proxies: indexing and .length behave exactly as usual, but
+  // Array.isArray() is false for them. Launching a profile by clicking its
+  // row passes precisely such an object, so validation has to test for a list
+  // the duck-typed way. The strict Array.isArray() guards on JSON.parse
+  // results elsewhere stay as they are -- there, rejecting a non-array is the
+  // whole point of the check.
+  function isListLike(value) {
+    return !!value && typeof value === "object" && typeof value.length === "number"
+  }
+
   // Resolve and validate the whole profile before making any desktop changes.
   function profileValidationError(profile) {
     if (!profile || !String(profile.name || "").trim()) return "A profile name is required."
-    if (!Array.isArray(profile.workspaces) || profile.workspaces.length === 0) return "Add at least one workspace."
+    if (!isListLike(profile.workspaces) || profile.workspaces.length === 0) return "Add at least one workspace."
     if (closeModes.indexOf(profile.closeMode || "trackedOnly") < 0) return "Invalid close mode."
     var seen = {}
     for (var i = 0; i < profile.workspaces.length; i++) {
@@ -646,7 +657,7 @@ done | sort -f
       seen[step.workspace] = true
       var preset = root.presetByName(step.preset)
       if (!preset) return "Missing preset: " + step.preset + ". Update the profile before launching."
-      if (!Array.isArray(preset.windows)) return "Invalid window list in " + preset.name + "."
+      if (!isListLike(preset.windows)) return "Invalid window list in " + preset.name + "."
       for (var j = 0; j < preset.windows.length; j++) {
         var w = preset.windows[j]
         if (!w || windowTypes.indexOf(w.type) < 0 || typeof w.value !== "string" || !w.value.trim())
