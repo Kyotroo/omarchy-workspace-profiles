@@ -372,7 +372,10 @@ done | sort -f
     lines.push('result=' + Util.shellQuote(root.onboardingResultPath))
     lines.push('luac_err=$(mktemp)')
     lines.push('mkdir -p "$(dirname "$result")"')
-    lines.push('write_result() { printf %s "$1" > "$result.tmp" && mv "$result.tmp" "$result"; }')
+    // Written to the state file *and* echoed on stdout: the panel reads the
+    // stdout copy, which cannot be missed the way a watch on a not-yet-created
+    // (and then atomically renamed) file can be.
+    lines.push('write_result() { printf %s "$1" > "$result.tmp" && mv "$result.tmp" "$result"; printf %s "$1"; }')
     lines.push('if [ ! -f "$bindings" ]; then write_result \'{"result":"error","message":"bindings.lua not found"}\'; rm -f "$luac_err"; exit 0; fi')
     lines.push('if grep -qF "activatePresetSlot" "$bindings"; then write_result \'{"result":"already-installed"}\'; rm -f "$luac_err"; exit 0; fi')
     lines.push('backup="$bindings.kdm-presets-backup-$(date +%s)"')
@@ -401,28 +404,49 @@ done | sort -f
     return lines.join('\n')
   }
 
+  // Runs the setup script as a tracked child so the panel learns it finished
+  // from the process exiting, not from noticing a file appear. The previous
+  // fire-and-forget + FileView(watchChanges) pairing could never see the
+  // result on a first run: the file does not exist when the watch is
+  // established, and write_result's atomic rename swaps the inode out from
+  // under any watch that did exist. Both cases left the panel sitting on
+  // "Setting up your shortcuts…" forever, with the setup itself already done.
   function acceptOnboardingShortcuts() {
     onboardingPhase = "running"
-    Util.execDetached(root.buildOnboardingScript())
+    onboardingResult = null
+    onboardingProcess.command = ["bash", "-lc", root.buildOnboardingScript()]
+    onboardingProcess.running = true
+    onboardingWatchdog.restart()
   }
 
-  function loadOnboardingResult(raw) {
+  // Single exit from "running", and it always leaves a result to show. An
+  // unreadable or missing report is reported as a failure rather than left
+  // to hang, since the script only stays silent when it died before
+  // write_result -- which is also when it changed nothing.
+  function resolveOnboarding(raw) {
+    if (root.onboardingPhase !== "running") return
+    onboardingWatchdog.stop()
+    var parsed = null
     try {
-      root.onboardingResult = JSON.parse(raw)
+      parsed = JSON.parse(String(raw).trim())
     } catch (e) {
-      root.onboardingResult = null
+      parsed = null
     }
-    if (root.onboardingResult) {
-      root.onboardingPhase = "done"
-      root.markOnboardingDone()
+    root.onboardingResult = parsed || {
+      result: "failed",
+      error: "Shortcut setup exited without reporting a result, so nothing was changed."
     }
+    root.onboardingPhase = "done"
+    root.markOnboardingDone()
   }
 
   onOpenedChanged: if (opened) {
     // Don't reset away from "activating" if a profile launch is still
     // running in the background — reopening the panel mid-launch should
-    // show live progress, not silently drop back to the preset list.
-    if (!activationRunning) {
+    // show live progress, not silently drop back to the preset list. Same
+    // for shortcut setup: dropping back to "ask" mid-run would strand the
+    // result the script is about to report.
+    if (!activationRunning && onboardingPhase !== "running") {
       mode = root.onboardingDone ? "list" : "onboarding"
       onboardingPhase = "ask"
     }
@@ -964,12 +988,29 @@ done | sort -f
     }
   }
 
-  FileView {
-    path: root.onboardingResultPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.loadOnboardingResult(text())
-    onFileChanged: reload()
+  Process {
+    id: onboardingProcess
+    stdout: StdioCollector { id: onboardingStdout; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) { root.resolveOnboarding(onboardingStdout.text) }
+  }
+
+  // Backstop for the one way the process itself can hang: the script's
+  // `hyprctl reload` / `hyprctl configerrors` blocking on an unresponsive
+  // compositor. Deliberately vague about what was written, because that is
+  // exactly what a timeout leaves unknown -- the backup path is stated so the
+  // user can check for themselves.
+  Timer {
+    id: onboardingWatchdog
+    interval: 20000
+    onTriggered: {
+      if (root.onboardingPhase !== "running") return
+      root.resolveOnboarding(JSON.stringify({
+        result: "failed",
+        error: "Shortcut setup timed out waiting for Hyprland. Check ~/.config/hypr/bindings.lua"
+          + " -- if it was written to, a .kdm-presets-backup-* copy of the original is beside it."
+      }))
+      onboardingProcess.running = false
+    }
   }
 
   IpcHandler {
